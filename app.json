@@ -25,7 +25,9 @@
       "backgroundColor": "#0B0B0F"
     },
     "plugins": [
-      "expo-font"
+      "expo-font",
+      "expo-sqlite",
+      "expo-secure-store"
     ]
   }
 }

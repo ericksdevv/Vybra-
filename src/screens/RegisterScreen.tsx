@@ -38,9 +38,9 @@ export function RegisterScreen() {
   const insets = useSafeAreaInsets();
   const { theme, registerUser, setAuthScreen, reducedMotion } = useVybra();
 
-  const [name, setName] = useState('Erick Anderson');
-  const [email, setEmail] = useState('erick@vybra.run');
-  const [password, setPassword] = useState('vybra2026');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [sport, setSport] = useState<SportType>('corrida');
   const [tone, setTone] = useState<AgentTone>('motivador');
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -60,7 +60,7 @@ export function RegisterScreen() {
     (password.trim() ? 0.25 : 0) +
     0.25;
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
     if (creating) return;
     if (!name.trim() || !email.trim() || !password.trim()) {
       setErrorText('Preencha nome, e-mail e senha para continuar.');
@@ -68,15 +68,24 @@ export function RegisterScreen() {
     }
     setErrorText(null);
     setCreating(true);
+
+    // Cria a conta no banco do aparelho (e-mail único, senha guardada só como hash).
+    const result = await registerUser({ name, email, password, sport, tone });
+    if (!result.ok) {
+      setCreating(false);
+      setErrorText(result.error);
+      return;
+    }
+
     triggerSuccessHaptic();
 
     if (reducedMotion) {
-      registerUser({ name, email, sport, tone });
+      result.enter();
       return;
     }
 
     timerRef.current = setTimeout(() => {
-      registerUser({ name, email, sport, tone });
+      result.enter();
     }, 480);
   };
 
@@ -336,7 +345,9 @@ export function RegisterScreen() {
 
           <PillButton
             label={creating ? 'Preparando seu painel...' : 'Começar jornada'}
-            onPress={handleSubmit}
+            onPress={() => {
+              void handleSubmit();
+            }}
             loading={creating}
             testID="register-submit-btn"
           />

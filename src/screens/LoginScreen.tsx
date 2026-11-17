@@ -59,8 +59,8 @@ export function LoginScreen() {
   const insets = useSafeAreaInsets();
   const { theme, loginUser, setAuthScreen, reducedMotion } = useVybra();
 
-  const [email, setEmail] = useState('erick@vybra.run');
-  const [password, setPassword] = useState('vybra2026');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [focusedField, setFocusedField] = useState<'email' | 'password' | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -124,7 +124,7 @@ export function LoginScreen() {
     ],
   }));
 
-  const handleLogin = () => {
+  const handleLogin = async () => {
     if (isAuthenticating) return;
     if (!email.trim() || !password.trim()) {
       setErrorText('Informe e-mail e senha para entrar.');
@@ -132,10 +132,19 @@ export function LoginScreen() {
     }
     setErrorText(null);
     setIsAuthenticating(true);
+
+    // Confere e-mail e senha no banco do aparelho ANTES de qualquer animação.
+    const result = await loginUser(email, password);
+    if (!result.ok) {
+      setIsAuthenticating(false);
+      setErrorText(result.error);
+      return;
+    }
+
     triggerSuccessHaptic();
 
     if (reducedMotion) {
-      loginUser(email);
+      result.enter();
       return;
     }
 
@@ -150,7 +159,7 @@ export function LoginScreen() {
     });
 
     authTimerRef.current = setTimeout(() => {
-      loginUser(email);
+      result.enter();
     }, MOTION.celebrate + 150);
   };
 
@@ -340,7 +349,9 @@ export function LoginScreen() {
               <View style={styles.actionsBlock}>
                 <PillButton
                   label={isAuthenticating ? 'Entrando...' : 'Entrar'}
-                  onPress={handleLogin}
+                  onPress={() => {
+                    void handleLogin();
+                  }}
                   loading={isAuthenticating}
                   testID="login-submit-btn"
                 />

@@ -51,30 +51,35 @@ export default function App() {
   }, []);
 
   if (!fontsLoaded) {
-    return (
-      <View style={styles.splashFallback}>
-        <StatusBar style="light" />
-        <Image
-          source={SPLASH_ICON}
-          style={{ width: 76, height: 76, borderRadius: 18 }}
-          resizeMode="contain"
-          accessibilityLabel="Ícone oficial do Vybra"
-        />
-        <ActivityIndicator
-          color={COLORS.secondary}
-          size="small"
-          style={styles.loader}
-        />
-      </View>
-    );
+    return <SplashFallback />;
   }
 
   return (
     <SafeAreaProvider>
-      <VybraProvider>
+      {/* Enquanto o banco local (SQLite) abre e carrega os dados salvos, mostra o splash. */}
+      <VybraProvider fallback={<SplashFallback />}>
         <AppShell />
       </VybraProvider>
     </SafeAreaProvider>
+  );
+}
+
+function SplashFallback() {
+  return (
+    <View style={styles.splashFallback}>
+      <StatusBar style="light" />
+      <Image
+        source={SPLASH_ICON}
+        style={{ width: 76, height: 76, borderRadius: 18 }}
+        resizeMode="contain"
+        accessibilityLabel="Ícone oficial do Vybra"
+      />
+      <ActivityIndicator
+        color={COLORS.secondary}
+        size="small"
+        style={styles.loader}
+      />
+    </View>
   );
 }
 

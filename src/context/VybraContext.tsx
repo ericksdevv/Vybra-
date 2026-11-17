@@ -9,6 +9,26 @@ import React, {
 } from 'react';
 import { AccessibilityInfo } from 'react-native';
 import {
+  accountsRepo,
+  ActivitySampleInput,
+  activitiesRepo,
+  chatRepo,
+  checkinsRepo,
+  LocalAccount,
+  loadSessionAccount,
+  loadUserData,
+  memoriesRepo,
+  newClientId,
+  reportsRepo,
+  sessionRepo,
+  settingsRepo,
+  SETTINGS_KEYS,
+  todayIsoDate,
+  UserDataSnapshot,
+  userSettingKey,
+} from '../db/database';
+import { clearTokens } from '../services/authStorage';
+import {
   ACHIEVEMENTS_MOCK,
   ACTIVITIES_MOCK,
   INITIAL_CHAT_MESSAGES,
@@ -37,7 +57,38 @@ import {
 
 const TAB_ORDER: TabKey[] = ['overview', 'metrics', 'workout', 'chat', 'settings'];
 
+/**
+ * Resultado do login/cadastro.
+ * ok → chame enter() para abrir o app (permite tocar a animação antes).
+ */
+export type AuthResult = { ok: true; enter: () => void } | { ok: false; error: string };
+
+const DEFAULT_CHECK_IN: CheckInState = {
+  energy: 4,
+  sleepHours: '7h30',
+  mood: 'Ótimo',
+  difficultDayActive: false,
+};
+
+const DEFAULT_NOTIFICATIONS: NotificationSettings = {
+  trainingReminder: true,
+  dailyEncouragement: true,
+  recoveryAlert: true,
+  quietHours: true,
+  leaveMeAloneToday: false,
+};
+
+const DEFAULT_PRIVACY: PrivacySettings = {
+  hideHomeZone: true,
+  hideWorkZone: false,
+  biometricLock: true,
+};
+
+const DEFAULT_TONE_NOTE = 'Direto quando eu estiver empolgado, acolhedor nos dias cansados.';
+
 interface VybraContextValue {
+  /** Id da conta logada neste aparelho (null = ninguém logado). */
+  userId: string | null;
   userName: string;
   userEmail: string;
   favoriteSport: SportType;
@@ -64,15 +115,22 @@ interface VybraContextValue {
   activePush: PushNotificationData | null;
   statusBanner: string | null;
   reducedMotion: boolean;
+  /** true quando o banco local (SQLite) abriu e os dados salvos foram carregados. */
+  isDbReady: boolean;
+  /** Mensagem quando o banco local não abriu (o app segue funcionando só em memória). */
+  dbError: string | null;
   setThemeId: (themeId: ThemeId) => void;
   setAuthScreen: (screen: AuthScreen) => void;
-  loginUser: (email?: string, name?: string) => void;
+  /** Confere e-mail + senha no banco local. */
+  loginUser: (email: string, password: string) => Promise<AuthResult>;
+  /** Cria a conta local (e-mail único) e prepara os dados dela. */
   registerUser: (payload: {
     name: string;
     email: string;
+    password: string;
     sport: SportType;
     tone: AgentTone;
-  }) => void;
+  }) => Promise<AuthResult>;
   logoutUser: () => void;
   navigateToTab: (tab: TabKey) => void;
   setAgentTone: (tone: AgentTone) => void;
@@ -86,6 +144,10 @@ interface VybraContextValue {
     paceLabel: string;
     elevationGainM: number;
     reportSummary?: string;
+    /** Opcional: amostras GPS da sessão (Passo 4). */
+    samples?: ActivitySampleInput[];
+    /** Opcional: início real do treino em ISO. Padrão: agora − duração. */
+    startedAtIso?: string;
   }) => void;
   sendWorkoutReport: (sport: SportType, elapsedLabel: string, text: string) => void;
   clearWorkoutReports: () => void;
@@ -207,9 +269,17 @@ function formatReplyForTone(tone: AgentTone, topic: string): ChatMessage {
   };
 }
 
-export function VybraProvider({ children }: { children: React.ReactNode }) {
-  const [userName, setUserName] = useState('Erick Anderson');
-  const [userEmail, setUserEmail] = useState('erick@vybra.run');
+export function VybraProvider({
+  children,
+  fallback = null,
+}: {
+  children: React.ReactNode;
+  /** Exibido enquanto o banco local abre e os dados salvos são carregados. */
+  fallback?: React.ReactNode;
+}) {
+  const [userId, setUserId] = useState<string | null>(null);
+  const [userName, setUserName] = useState('');
+  const [userEmail, setUserEmail] = useState('');
   const [favoriteSport, setFavoriteSport] = useState<SportType>('corrida');
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
@@ -218,15 +288,8 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
   const [tabDirection, setTabDirection] = useState<1 | -1>(1);
   const [themeId, setThemeIdState] = useState<ThemeId>('vybra-neon');
   const [agentTone, setAgentTone] = useState<AgentTone>('motivador');
-  const [customToneNote, setCustomToneNote] = useState(
-    'Direto quando eu estiver empolgado, acolhedor nos dias cansados.'
-  );
-  const [checkIn, setCheckIn] = useState<CheckInState>({
-    energy: 4,
-    sleepHours: '7h30',
-    mood: 'Ótimo',
-    difficultDayActive: false,
-  });
+  const [customToneNote, setCustomToneNote] = useState(DEFAULT_TONE_NOTE);
+  const [checkIn, setCheckIn] = useState<CheckInState>(DEFAULT_CHECK_IN);
   const [activities, setActivities] = useState<Activity[]>(ACTIVITIES_MOCK);
   const [selectedActivity, setSelectedActivity] = useState<Activity | null>(null);
   const [achievements, setAchievements] = useState<Achievement[]>(ACHIEVEMENTS_MOCK);
@@ -235,25 +298,124 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>(INITIAL_CHAT_MESSAGES);
   const [isAgentTyping, setIsAgentTyping] = useState(false);
   const [workoutReports, setWorkoutReports] = useState<WorkoutReport[]>([]);
-  const [notifications, setNotifications] = useState<NotificationSettings>({
-    trainingReminder: true,
-    dailyEncouragement: true,
-    recoveryAlert: true,
-    quietHours: true,
-    leaveMeAloneToday: false,
-  });
-  const [privacy, setPrivacy] = useState<PrivacySettings>({
-    hideHomeZone: true,
-    hideWorkZone: false,
-    biometricLock: true,
-  });
+  const [notifications, setNotifications] = useState<NotificationSettings>(DEFAULT_NOTIFICATIONS);
+  const [privacy, setPrivacy] = useState<PrivacySettings>(DEFAULT_PRIVACY);
   const [activePush, setActivePush] = useState<PushNotificationData | null>(null);
   const [pushIndex, setPushIndex] = useState(0);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
 
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [isDbReady, setIsDbReady] = useState(false);
+  const [dbError, setDbError] = useState<string | null>(null);
+
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const statusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Refs para ler o valor mais recente dentro de callbacks sem recriá-los.
+  const dbAvailableRef = useRef(false);
+  const userIdRef = useRef<string | null>(null);
+  /** Só usado se o banco do aparelho não abrir: contas guardadas em memória até fechar o app. */
+  const memoryAccountsRef = useRef(
+    new Map<string, { name: string; password: string; sport: SportType; tone: AgentTone }>()
+  );
+  const checkInRef = useRef(checkIn);
+  const workoutReportsRef = useRef<WorkoutReport[]>([]);
+  const lastSavedProfileRef = useRef('');
+  const lastSavedNotificationsRef = useRef('');
+  const lastSavedPrivacyRef = useRef('');
+
+  useEffect(() => {
+    checkInRef.current = checkIn;
+  }, [checkIn]);
+
+  useEffect(() => {
+    workoutReportsRef.current = workoutReports;
+  }, [workoutReports]);
+
+  /** Coloca a conta no estado (perfil, tom, tema). */
+  const applyAccount = useCallback((account: LocalAccount) => {
+    userIdRef.current = account.id;
+    setUserId(account.id);
+    setUserName(account.name);
+    setUserEmail(account.email);
+    setFavoriteSport(account.favoriteSport);
+    setAgentTone(account.agentTone);
+    setCustomToneNote(account.customToneNote);
+    if (VYBRA_THEMES[account.themeId]) setThemeIdState(account.themeId);
+    lastSavedProfileRef.current = JSON.stringify({
+      name: account.name,
+      email: account.email,
+      favoriteSport: account.favoriteSport,
+      agentTone: account.agentTone,
+      customToneNote: account.customToneNote,
+      themeId: VYBRA_THEMES[account.themeId] ? account.themeId : 'vybra-neon',
+    });
+  }, []);
+
+  /** Substitui TODOS os dados da tela pelos da conta (nada da conta anterior fica). */
+  const applyUserData = useCallback((data: UserDataSnapshot) => {
+    const nextCheckIn = data.todayCheckIn ?? DEFAULT_CHECK_IN;
+    const nextNotifications = data.notifications ?? DEFAULT_NOTIFICATIONS;
+    const nextPrivacy = data.privacy ?? DEFAULT_PRIVACY;
+    const accepted = data.aiChallengeAccepted;
+
+    setActivities(data.activities);
+    setMemories(data.memories);
+    setChatMessages(data.chatMessages);
+    setCheckIn(nextCheckIn);
+    checkInRef.current = nextCheckIn;
+    setNotifications(nextNotifications);
+    lastSavedNotificationsRef.current = JSON.stringify(nextNotifications);
+    setPrivacy(nextPrivacy);
+    lastSavedPrivacyRef.current = JSON.stringify(nextPrivacy);
+    setAchievements(
+      ACHIEVEMENTS_MOCK.map((a) =>
+        a.isAiSuggested && accepted && accepted[a.id] !== undefined
+          ? { ...a, aiAccepted: accepted[a.id] }
+          : a
+      )
+    );
+    setWorkoutReports([]);
+    workoutReportsRef.current = [];
+    setSelectedActivity(null);
+    setActiveTab('overview');
+    setPreviousTab('overview');
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Carga inicial do SQLite local (offline-first)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const account = await loadSessionAccount();
+        const data = account ? await loadUserData(account.id) : null;
+        if (cancelled) return;
+
+        dbAvailableRef.current = true;
+        if (account && data) {
+          applyAccount(account);
+          applyUserData(data);
+          setIsAuthenticated(true);
+        }
+        setIsDbReady(true);
+      } catch (error) {
+        console.warn('[Vybra DB] Falha ao abrir o banco local:', error);
+        if (cancelled) return;
+        dbAvailableRef.current = false;
+        setDbError('Banco local indisponível. Os dados desta sessão não serão salvos no aparelho.');
+      } finally {
+        if (!cancelled) setIsHydrated(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [applyAccount, applyUserData]);
 
   useEffect(() => {
     let mounted = true;
@@ -284,25 +446,187 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
     }, 2600);
   }, []);
 
-  const loginUser = useCallback((email?: string, name?: string) => {
-    if (email?.trim()) setUserEmail(email.trim());
-    if (name?.trim()) setUserName(name.trim());
-    setActiveTab('overview');
-    setPreviousTab('overview');
-    setIsAuthenticated(true);
-  }, []);
+  /** Grava no SQLite em segundo plano, sempre na conta logada. A UI já foi atualizada (otimista). */
+  const persist = useCallback(
+    (label: string, task: (userId: string) => Promise<unknown>) => {
+      const currentUserId = userIdRef.current;
+      if (!dbAvailableRef.current || !currentUserId) return;
+      task(currentUserId).catch((error: unknown) => {
+        console.warn(`[Vybra DB] ${label}:`, error);
+        showStatusBanner('Não consegui salvar no aparelho. Tente de novo.');
+      });
+    },
+    [showStatusBanner]
+  );
+
+  useEffect(() => {
+    if (dbError) showStatusBanner(dbError);
+  }, [dbError, showStatusBanner]);
+
+  // Perfil (nome, esporte, tom, nota do tom e tema) → accounts (com debounce).
+  useEffect(() => {
+    if (!isDbReady || !userId) return;
+    const profile = {
+      name: userName,
+      email: userEmail,
+      favoriteSport,
+      agentTone,
+      customToneNote,
+      themeId,
+    };
+    const json = JSON.stringify(profile);
+    if (json === lastSavedProfileRef.current) return;
+    const handle = setTimeout(() => {
+      lastSavedProfileRef.current = json;
+      persist('Salvar perfil', (uid) => accountsRepo.updateProfile(uid, profile));
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [isDbReady, userId, userName, userEmail, favoriteSport, agentTone, customToneNote, themeId, persist]);
+
+  // Preferências de notificação → app_settings + fila de sync (regras de silêncio do push).
+  useEffect(() => {
+    if (!isDbReady || !userId) return;
+    const json = JSON.stringify(notifications);
+    if (json === lastSavedNotificationsRef.current) return;
+    lastSavedNotificationsRef.current = json;
+    persist('Salvar notificações', (uid) =>
+      settingsRepo.set(
+        userSettingKey(uid, SETTINGS_KEYS.notifications),
+        {
+          ...notifications,
+          leaveMeAloneDateIso: notifications.leaveMeAloneToday ? todayIsoDate() : null,
+        },
+        { syncForUserId: uid, syncKey: SETTINGS_KEYS.notifications }
+      )
+    );
+  }, [isDbReady, userId, notifications, persist]);
+
+  // Privacidade (inclui bloqueio biométrico) → app_settings + fila de sync.
+  useEffect(() => {
+    if (!isDbReady || !userId) return;
+    const json = JSON.stringify(privacy);
+    if (json === lastSavedPrivacyRef.current) return;
+    lastSavedPrivacyRef.current = json;
+    persist('Salvar privacidade', (uid) =>
+      settingsRepo.set(userSettingKey(uid, SETTINGS_KEYS.privacy), privacy, {
+        syncForUserId: uid,
+        syncKey: SETTINGS_KEYS.privacy,
+      })
+    );
+  }, [isDbReady, userId, privacy, persist]);
+
+  const loginUser = useCallback(
+    async (email: string, password: string): Promise<AuthResult> => {
+      if (!email.trim() || !password) {
+        return { ok: false, error: 'Informe e-mail e senha para entrar.' };
+      }
+
+      // Sem banco (ex.: navegador sem suporte): confere as contas criadas nesta sessão.
+      if (!dbAvailableRef.current) {
+        const key = email.trim().toLowerCase();
+        const memoryAccount = memoryAccountsRef.current.get(key);
+        if (!memoryAccount || memoryAccount.password !== password) {
+          return { ok: false, error: 'E-mail ou senha incorretos.' };
+        }
+        return {
+          ok: true,
+          enter: () => {
+            setUserName(memoryAccount.name);
+            setUserEmail(key);
+            setFavoriteSport(memoryAccount.sport);
+            setAgentTone(memoryAccount.tone);
+            setActiveTab('overview');
+            setPreviousTab('overview');
+            setIsAuthenticated(true);
+          },
+        };
+      }
+
+      try {
+        const result = await accountsRepo.login(email, password);
+        if (!result.ok) return result;
+        const data = await loadUserData(result.account.id);
+        // Quando a API existir: POST /auth/login → saveTokens() no SecureStore.
+        return {
+          ok: true,
+          enter: () => {
+            applyAccount(result.account);
+            applyUserData(data);
+            setIsAuthenticated(true);
+          },
+        };
+      } catch (error) {
+        console.warn('[Vybra DB] Login:', error);
+        return { ok: false, error: 'Não consegui acessar os dados do aparelho. Tente de novo.' };
+      }
+    },
+    [applyAccount, applyUserData]
+  );
 
   const registerUser = useCallback(
-    (payload: { name: string; email: string; sport: SportType; tone: AgentTone }) => {
-      if (payload.name.trim()) setUserName(payload.name.trim());
-      if (payload.email.trim()) setUserEmail(payload.email.trim());
-      setFavoriteSport(payload.sport);
-      setAgentTone(payload.tone);
-      setActiveTab('overview');
-      setPreviousTab('overview');
-      setIsAuthenticated(true);
+    async (payload: {
+      name: string;
+      email: string;
+      password: string;
+      sport: SportType;
+      tone: AgentTone;
+    }): Promise<AuthResult> => {
+      if (!dbAvailableRef.current) {
+        const key = payload.email.trim().toLowerCase();
+        if (!payload.name.trim() || !key) return { ok: false, error: 'Preencha nome e e-mail.' };
+        if (payload.password.length < 6) {
+          return { ok: false, error: 'A senha precisa ter pelo menos 6 caracteres.' };
+        }
+        if (memoryAccountsRef.current.has(key)) {
+          return { ok: false, error: 'Já existe uma conta com este e-mail. Faça login.' };
+        }
+        memoryAccountsRef.current.set(key, {
+          name: payload.name.trim(),
+          password: payload.password,
+          sport: payload.sport,
+          tone: payload.tone,
+        });
+        return {
+          ok: true,
+          enter: () => {
+            setUserName(payload.name.trim());
+            setUserEmail(payload.email.trim());
+            setFavoriteSport(payload.sport);
+            setAgentTone(payload.tone);
+            setActiveTab('overview');
+            setPreviousTab('overview');
+            setIsAuthenticated(true);
+          },
+        };
+      }
+
+      try {
+        const result = await accountsRepo.register({
+          name: payload.name,
+          email: payload.email,
+          password: payload.password,
+          favoriteSport: payload.sport,
+          agentTone: payload.tone,
+          customToneNote: DEFAULT_TONE_NOTE,
+          themeId,
+        });
+        if (!result.ok) return result;
+        const data = await loadUserData(result.account.id);
+        // Quando a API existir: POST /auth/register → saveTokens() no SecureStore.
+        return {
+          ok: true,
+          enter: () => {
+            applyAccount(result.account);
+            applyUserData(data);
+            setIsAuthenticated(true);
+          },
+        };
+      } catch (error) {
+        console.warn('[Vybra DB] Cadastro:', error);
+        return { ok: false, error: 'Não consegui criar a conta no aparelho. Tente de novo.' };
+      }
     },
-    []
+    [applyAccount, applyUserData, themeId]
   );
 
   const logoutUser = useCallback(() => {
@@ -311,6 +635,15 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
     setActivePush(null);
     setAuthScreen('login');
     setIsAuthenticated(false);
+    // Os dados na tela são todos substituídos no próximo login (applyUserData).
+    userIdRef.current = null;
+    setUserId(null);
+    if (dbAvailableRef.current) {
+      sessionRepo.setUserId(null).catch((error: unknown) => {
+        console.warn('[Vybra DB] Encerrar sessão:', error);
+      });
+    }
+    clearTokens().catch(() => {});
   }, []);
 
   const navigateToTab = useCallback(
@@ -325,9 +658,16 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
     [activeTab]
   );
 
-  const updateCheckIn = useCallback((patch: Partial<CheckInState>) => {
-    setCheckIn((prev) => ({ ...prev, ...patch }));
-  }, []);
+  const updateCheckIn = useCallback(
+    (patch: Partial<CheckInState>) => {
+      const next: CheckInState = { ...checkInRef.current, ...patch };
+      checkInRef.current = next;
+      setCheckIn(next);
+      // daily_checkins (chave = data de hoje) + fila → PUT /checkins/today
+      persist('Salvar check-in', (uid) => checkinsRepo.upsertToday(uid, next));
+    },
+    [persist]
+  );
 
   const selectActivity = useCallback((activity: Activity | null) => {
     setSelectedActivity(activity);
@@ -349,7 +689,15 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       paceLabel: string;
       elevationGainM: number;
       reportSummary?: string;
+      samples?: ActivitySampleInput[];
+      startedAtIso?: string;
     }) => {
+      const clientId = newClientId();
+      const startedAtIso =
+        workout.startedAtIso ?? new Date(Date.now() - workout.durationSec * 1000).toISOString();
+      // Cálculo é código: pace médio (s/km) = duração / distância.
+      const paceSeconds =
+        workout.distanceKm > 0 ? Math.round(workout.durationSec / workout.distanceKm) : 0;
       const mins = Math.floor(workout.durationSec / 60);
       const secs = workout.durationSec % 60;
       const titleBySport: Record<SportType, string> = {
@@ -361,7 +709,7 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
         natacao: 'Sessão de Natação Registrada',
       };
       const newActivity: Activity = {
-        id: `act-${Date.now()}`,
+        id: clientId,
         title: titleBySport[workout.sport],
         sport: workout.sport,
         dateLabel: 'Hoje',
@@ -369,7 +717,7 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
         distanceKm: Number(workout.distanceKm.toFixed(2)),
         durationLabel: `${mins}m ${String(secs).padStart(2, '0')}s`,
         paceLabel: workout.paceLabel,
-        paceSeconds: 290,
+        paceSeconds,
         elevationGainM: workout.elevationGainM,
         avgHeartRate: 152,
         cadenceSpm: 172,
@@ -389,9 +737,28 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
           : 'Ótimo registro! Esse treino já entrou na sua linha do tempo para comparação nas próximas sessões.',
       };
       setActivities((prev) => [newActivity, ...prev]);
-      showStatusBanner('Treino salvo no seu histórico local (simulado).');
+
+      const reportIds = workoutReportsRef.current
+        .filter((r) => r.sport === workout.sport)
+        .map((r) => r.id);
+
+      if (dbAvailableRef.current) {
+        persist('Salvar treino', (uid) =>
+          activitiesRepo.saveCompleted(uid, {
+            activity: newActivity,
+            clientId,
+            startedAtIso,
+            durationSec: workout.durationSec,
+            samples: workout.samples,
+            reportIds,
+          })
+        );
+        showStatusBanner('Treino salvo no seu aparelho. Sincroniza quando houver internet.');
+      } else {
+        showStatusBanner('Treino adicionado (banco local indisponível nesta sessão).');
+      }
     },
-    [showStatusBanner]
+    [persist, showStatusBanner]
   );
 
   const sendWorkoutReport = useCallback(
@@ -406,7 +773,7 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       const sportLabel = sportMeta?.label ?? sport;
 
       const entry: WorkoutReport = {
-        id: `rep-${Date.now()}`,
+        id: newClientId(),
         sport,
         elapsedLabel,
         timestamp,
@@ -444,9 +811,13 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       };
 
       setChatMessages((prev) => [...prev, userMsg, agentMsg]);
+      persist('Salvar reporte', async (uid) => {
+        await reportsRepo.insert(uid, entry);
+        await chatRepo.insertMany(uid, [userMsg, agentMsg]);
+      });
       showStatusBanner('Reporte enviado para o chat com o Vybra.');
     },
-    [showStatusBanner]
+    [persist, showStatusBanner]
   );
 
   const clearWorkoutReports = useCallback(() => {
@@ -458,21 +829,33 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       setAchievements((prev) =>
         prev.map((a) => (a.isAiSuggested ? { ...a, aiAccepted: accepted } : a))
       );
+      const acceptedById: Record<string, boolean> = {};
+      ACHIEVEMENTS_MOCK.forEach((a) => {
+        if (a.isAiSuggested) acceptedById[a.id] = accepted;
+      });
+      persist('Salvar desafio', (uid) =>
+        settingsRepo.set(userSettingKey(uid, SETTINGS_KEYS.aiChallenge), acceptedById, {
+          syncForUserId: uid,
+          syncKey: SETTINGS_KEYS.aiChallenge,
+        })
+      );
       showStatusBanner(
         accepted
           ? 'Desafio personalizado aceito! O Vybra vai acompanhar sua meta.'
           : 'Desafio dispensado sem pressão.'
       );
     },
-    [showStatusBanner]
+    [persist, showStatusBanner]
   );
 
   const removeMemoryFact = useCallback(
     (id: string) => {
       setMemories((prev) => prev.filter((item) => item.id !== id));
+      // Apaga local + fila → DELETE /memories/:id (fato e embedding no servidor)
+      persist('Remover memória', (uid) => memoriesRepo.remove(uid, id));
       showStatusBanner('Memória removida com transparência.');
     },
-    [showStatusBanner]
+    [persist, showStatusBanner]
   );
 
   const addMemoryFact = useCallback(
@@ -480,15 +863,16 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       const trimmed = text.trim();
       if (!trimmed) return;
       const fact: MemoryFact = {
-        id: `mem-${Date.now()}`,
+        id: newClientId(),
         layer,
         text: trimmed,
         date: 'Agora mesmo',
       };
       setMemories((prev) => [fact, ...prev]);
+      persist('Salvar memória', (uid) => memoriesRepo.insert(uid, fact));
       showStatusBanner('Fato salvo na memória do Vybra.');
     },
-    [showStatusBanner]
+    [persist, showStatusBanner]
   );
 
   const sendChatMessage = useCallback(
@@ -501,22 +885,25 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       ).padStart(2, '0')}`;
 
       const userMsg: ChatMessage = {
-        id: `user-${Date.now()}`,
+        id: `user-${newClientId()}`,
         sender: 'user',
         text: trimmed,
         timestamp,
       };
       setChatMessages((prev) => [...prev, userMsg]);
+      persist('Salvar mensagem', (uid) => chatRepo.insert(uid, userMsg));
       setIsAgentTyping(true);
 
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       typingTimeoutRef.current = setTimeout(() => {
-        const reply = formatReplyForTone(agentTone, trimmed);
+        // Quando a API existir: POST /chat/message (Gemini + ferramentas) substitui esta resposta local.
+        const reply = { ...formatReplyForTone(agentTone, trimmed), id: `agent-${newClientId()}` };
         setChatMessages((prev) => [...prev, reply]);
+        persist('Salvar resposta', (uid) => chatRepo.insert(uid, reply));
         setIsAgentTyping(false);
       }, 650);
     },
-    [agentTone]
+    [agentTone, persist]
   );
 
   const updateNotificationSetting = useCallback(
@@ -555,6 +942,7 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
 
   const value = useMemo<VybraContextValue>(
     () => ({
+      userId,
       userName,
       userEmail,
       favoriteSport,
@@ -581,6 +969,8 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       activePush,
       statusBanner,
       reducedMotion,
+      isDbReady,
+      dbError,
       setThemeId,
       setAuthScreen,
       loginUser,
@@ -606,6 +996,7 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       showStatusBanner,
     }),
     [
+      userId,
       userName,
       userEmail,
       favoriteSport,
@@ -632,6 +1023,8 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       activePush,
       statusBanner,
       reducedMotion,
+      isDbReady,
+      dbError,
       setThemeId,
       loginUser,
       registerUser,
@@ -653,6 +1046,8 @@ export function VybraProvider({ children }: { children: React.ReactNode }) {
       showStatusBanner,
     ]
   );
+
+  if (!isHydrated) return <>{fallback}</>;
 
   return <VybraContext.Provider value={value}>{children}</VybraContext.Provider>;
 }
